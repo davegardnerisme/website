@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+  <meta charset="utf-8">
+  <title>Stream de-duplication</title>
+  <meta name="description" content="Engineering Manager at Apple">
+  <meta name="author" content="Dave Gardner">
+
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <link href="//fonts.googleapis.com/css?family=Raleway:400,300,600" rel="stylesheet" type="text/css">
+
+  <link rel="stylesheet" href="/css/normalize.css">
+  <link rel="stylesheet" href="/css/skeleton.css">
+
+  <link rel="icon" type="image/png" href="/images/favicon.png">
+
+  <style type="text/css">
+    h1 { margin-top: 1em; }
+    h3 { margin-top: 1.6em; }
+    h4 { font-size: 1.5em; margin-top: 1em; }
+    h5 { font-size: 1.3em; margin-top: 1em; }
+  </style>
+
+</head>
+<body>
+
+  <div class="container">
+    <div class="row">
+      <div class="column">
+        <h1>Stream de-duplication</h1>
+        <p><em>This was originally posted in November 2012 and is left here as an archive. I would advise checking out <a target="_blank" href="https://kafka.apache.org">Kafka</a>.</em></p>
+
+        <hr />
+
+        <p>I&#8217;ve recently started playing around with <a href="https://github.com/bitly/nsq" target="_blank">NSQ</a>, in my hunt for a good, resilient, highly available, guaranteed “at least once” delivery queue. That’s a lot of adjectives, but basically it boils down to a queue that puts a copy of messages on N nodes and is able to operate (without losing messages) with any X of them failing, obviously where X &lt; N.</p>
+        <p>NSQ attacks this problem in an interesting way. Instead of trying to form a cluster (in the sense that say RabbitMQ does), it instead treats each <strong>`nsqd`</strong> instance as a separate entity. It is only the clients that know there is more than one of them, and the directory service <strong>`nsqlookupd`</strong>. This actually makes it very reliable, in the sense that there are no troublesome master/slave relationships to preserve or leaders to elect.</p>
+      <p>This simplicity forces some of the work back on the client.</p>
+      <ul>
+        <li>NSQ is guaranteed “at least once”, rather than “exactly once”; hence subscribers should operate in an idempotent way</li>
+        <li>when using with replication, it is up to the client to de-duplicate the messages on subscription</li>
+      </ul>
+
+      <h3 id="deduplication">Deduplication</h3>
+      <p>To de-duplicate, a subscriber needs to determine if it has seen a message before. Doing so in an accurate way would involve storing all the message IDs or some digest of the message itself in a large hash table. With this we could simply test:</p>
+      <pre>if (message is in hash map) {
+    ignore
+}
+process</pre>
+      <p>Then we just need to make sure we add messages seen to the hash map. With a lossless hash map (eg: store everything), this is going to use unbounded memory.</p>
+
+      <h3 id="oppositeofbloomfilter">The opposite of a Bloom filter</h3>
+      <p>Bloom filters were my first thought when trying to come up with a way of bounding memory. Bloom filters are a probabilistic data structure that is able to test if some element is a member of a set. A Bloom filter will never tell you an item is in the set if it isn&#8217;t (no false negatives), but may tell you it is in the set when really it isn’t (chance of false positives).</p>
+      <p>What I actually want is _the opposite_ of a Bloom filter.</p>
+      <p><a href="http://lmgtfy.com/?q=opposite+of+a+bloom+filter" target="_blank">http://lmgtfy.com/?q=opposite+of+a+bloom+filter</a></p>
+      <p>So picking the first link on Google, I checked out the <a href="http://somethingsimilar.com/2012/05/21/the-opposite-of-a-bloom-filter/" target="_blank">blog post on somethingsimilar.com</a>. <a href="https://twitter.com/jmhodges" target="_blank">@jmhodges</a>’s solution is simple; use a fixed-size hash map and then simply overwrite entries on collision. Let’s go through that slowly.</p>
+      <p>Here’s our hash map, with 10 buckets:</p>
+      <p><img title="Our empty hash buckets" src="/images/buckets01.png" alt="Our empty hash buckets" width="599" height="97" /></p>
+      <p>Now we process our first message and add it:</p>
+      <p><img title="Our content hashes to bucket 3" src="/images/buckets02.png" alt="Our content hashes to bucket 3" width="586" height="165" /></p>
+      <p>To test if some new message has been seen we need to check whether we have got <strong>exactly this message content</strong> within the appropriate bucket. If the content does match, then we can be sure we’ve seen it. If the content does not match, then we cannot know. The reason is that we may have <em>just</em> overwritten this message with a new message that collided into the same bucket.</p>
+      <p>So now we write in our next message, and it hashes to the same bucket. At this point we&#8217;ve lost our knowledge of having ever seen the first message we processed.</p>
+      <p><img title="Our next item also hashes to bucket 3; now we have lost knowledge of having seen the previous item" src="/images/buckets03.png" alt="Our next item also hashes to bucket 3; now we have lost knowledge of having seen the previous item" width="586" height="174" /></p>
+
+      <h3 id="decidinghowbigtomakeit">Deciding how big to make it</h3>
+      <p>So with this data structure, we will lose knowledge of messages we have seen; however we can determine how quickly this happens by choosing the size of our hash map (how many buckets we have).</p>
+      <p>Intuitively, there is a trade off between the amount of space used and our ability to detect duplications. At one extreme, with 1 bucket, we can only ever de-duplicate if we receive messages in order. At the other extreme, with a huge number of buckets, we can <em>nearly always</em> de-duplicate (we are bounded by our hash function’s ability to determine unique values for different content).</p>
+      <p>To get a clearer picture, we can consider our implementation in terms of probability. Starting with a single message stored, the probability of overwriting this message with the next message (assuming a perfectly random hash function), is 1/N, where N is the number of buckets.</p>
+      <p><img title="First iteration; chance of removing knowledge of some previously processed message" src="/images/sd-equation03.png" alt="First iteration; chance of removing knowledge of some previously processed message" width="100" height="77" /></p>
+      <p>On our next go, the chances of us overwriting <em>on this go</em> is:</p>
+      <p><img title="Probability of overwriting on _exactly the second go_" src="/images/sd-equation04.png" alt="Probability of overwriting on _exactly the second go_" width="193" height="80" /></p>
+      <p>This combines the probability of us _not_ having overwritten on the first go with the probability of overwriting this time. To get the probability of us having overwritten <em>by this go</em>, we simply add up:</p>
+      <p><img title="Probability of having overwritten _by the second go_" src="/images/sd-equation05.png" alt="Probability of having overwritten _by the second go_" width="238" height="88" /></p>
+      <p>Our next go looks like this:</p>
+      <p><img title="Probability of overwriting by the third go!" src="../../../../wp-content/uploads/2012/11/sd-equation06.png" alt="Probability of overwriting by the third go!" width="569" height="84" /></p>
+      <p>And we can express this as a sum, for any given x (where x is the number of additional messages we&#8217;ve written into our hash map):</p>
+      <p><img title="Probability of having lost some initial message after X goes, with N buckets." src="/images/sd-equation01.png" alt="Probability of having lost some initial message after X goes, with N buckets." width="229" height="87" /></p>
+      <p>Plotting this, for N=100, we get:</p>
+      <p><img title="Probability of having overwritten a previously stored message after X further messages processed (x axis) for N=100" src="/images/forn100.png" alt="Probability of having overwritten a previously stored message after X further messages processed (x axis) for N=100" width="613" height="461" /></p>
+      <p>So what we are saying here is that with 100 buckets, after adding 459 additional messages, we are 99% certain to have overwritten our initial message and hence 99% certain that we won’t be able to de-duplicate this message if it turned up again.</p>
+      <p>We can work out the equation of this graph:</p>
+      <p><img title="Solved" src="/images/sd-equation02.png" alt="Solved" width="247" height="88" /></p>
+      <p>We can visualise this as it varies with both N and X:</p>
+      <p><img title="Surface plot of equation as it varies in X and N" src="/images/surfaceplot.png" alt="Surface plot of equation as it varies in X and N" width="635" height="466" /></p>
+      <p>So if we want to be able to de-duplicate (to 90% chance) a stream running at 1,000 events per second, with an hour delay (y = 0.9, x = 1000*60*60):</p>
+      <pre>0.9 = 1 - (1-1/N) ^ 3600000
+0.1 = (1-1/N) ^ 3600000
+0.999999360393234 = 1-1/N
+1 / N = 0.000000639606766</pre>
+      <p>So N = <strong>1,563,461</strong></p>
+
+      <h3 id="nsqphp">NSQPHP implementation</h3>
+      <p>The @jmhodges implementation of opposite of a Bloom filter has an atomic “check and set” to test membership. <strong>nsqphp</strong> ships with two implementations which implement the same basic interface. The <a href="https://github.com/davegardnerisme/nsqphp/blob/master/src/nsqphp/Dedupe/OppositeOfBloomFilter.php" target="_blank">first implementation</a> runs in a single process (and hence doesn&#8217;t have to worry about this anyway &#8211; due to PHP&#8217;s lack of threads).</p>
+      <p><script src="http://gist-it.appspot.com/github/davegardnerisme/nsqphp/raw/master/src/nsqphp/Dedupe/OppositeOfBloomFilter.php#L56-85"></script></p>
+      <p>In this implementation I’m actually using an MD5 of the entire content, to save space. This introduces a theoretical possibility that I could give a false negative (saying it’s seen a message when it hasn’t).</p>
+      <p>The <a href="https://github.com/davegardnerisme/nsqphp/blob/master/src/nsqphp/Dedupe/OppositeOfBloomFilterMemcached.php" target="_blank">second implementation</a> uses Memcached to store the actual hash map; this completely ignores races on the basis that they will only mean we may not quite de-duplicate as many messages as we could have.</p>
+      <p>The only other complication is with failed messages; here we need to <em>erase</em> our knowledge of having “seen” a message. To achieve this we simply update our hash map so that the message we’re interested in is no longer the content within the hash bucket:</p>
+<pre class="code">if (entry at hash index foo is our content) {
+    overwrite with some placeholder (eg: "deleted")
+}</pre>
+
+        <p><a href="/">Back home</a>.</p>
+        <p>Built with <a href="http://www.getskeleton.com">Skeleton</a>.</p>
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>
